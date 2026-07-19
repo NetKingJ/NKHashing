@@ -1,0 +1,2 @@
+Temporary trigger file for the authorized Fly CTF retrieval workflow.
+Original image retrieval: 3
