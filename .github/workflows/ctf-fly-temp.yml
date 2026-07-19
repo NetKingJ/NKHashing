@@ -1,9 +1,8 @@
 name: Temporary Fly CTF Retrieval
 
 on:
-  push:
-    paths:
-      - '.github/workflows/ctf-fly-temp.yml'
+  pull_request:
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
 
 permissions:
