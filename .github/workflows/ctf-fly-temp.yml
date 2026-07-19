@@ -12,7 +12,7 @@ permissions:
 jobs:
   retrieve:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -25,12 +25,12 @@ jobs:
           pip install playwright
           playwright install chromium --with-deps
 
-      - name: Retrieve Proton Drive share
+      - name: Inspect Proton Drive share
         env:
           SHARE_URL: 'https://drive.proton.me/urls/E73WE0CN2C#FscRsttW3OYJ'
         run: |
-          cat > /tmp/retrieve.py <<'PY'
-          import asyncio, json, os, re, traceback
+          cat > retrieve.py <<'PY'
+          import asyncio, json, os, traceback
           from pathlib import Path
           from playwright.async_api import async_playwright
 
@@ -39,83 +39,57 @@ jobs:
           URL = os.environ['SHARE_URL']
 
           async def main():
-              logs = {'console': [], 'requests': [], 'responses': [], 'errors': [], 'candidates': []}
+              logs = {'console': [], 'requests': [], 'responses': [], 'errors': [], 'elements': []}
               async with async_playwright() as p:
                   browser = await p.chromium.launch(headless=True)
                   context = await browser.new_context(accept_downloads=True, viewport={'width': 1440, 'height': 1000})
                   page = await context.new_page()
                   page.on('console', lambda m: logs['console'].append(f'{m.type}: {m.text}'))
                   page.on('pageerror', lambda e: logs['errors'].append(str(e)))
-                  page.on('request', lambda r: logs['requests'].append(r.url) if len(logs['requests']) < 1000 else None)
-                  page.on('response', lambda r: logs['responses'].append({'status': r.status, 'url': r.url}) if len(logs['responses']) < 1000 else None)
+                  page.on('request', lambda r: logs['requests'].append({'method':r.method,'resource':r.resource_type,'url':r.url}) if len(logs['requests']) < 1500 else None)
+                  page.on('response', lambda r: logs['responses'].append({'status':r.status,'url':r.url,'content_type':r.headers.get('content-type','')}) if len(logs['responses']) < 1500 else None)
                   await page.goto(URL, wait_until='domcontentloaded', timeout=120000)
-                  try:
-                      await page.wait_for_load_state('networkidle', timeout=30000)
-                  except Exception:
-                      pass
-                  await page.wait_for_timeout(15000)
-                  for label in ['Accept all', 'Accept', 'I agree', 'Got it']:
-                      try:
-                          loc = page.get_by_role('button', name=re.compile(f'^{re.escape(label)}$', re.I))
-                          if await loc.count():
-                              await loc.first.click(timeout=3000)
-                              await page.wait_for_timeout(1000)
-                              break
-                      except Exception:
-                          pass
+                  await page.wait_for_timeout(20000)
                   await page.screenshot(path=str(OUT/'page.png'), full_page=True)
                   (OUT/'page.html').write_text(await page.content(), encoding='utf-8')
-                  try:
-                      (OUT/'body.txt').write_text(await page.locator('body').inner_text(), encoding='utf-8')
-                  except Exception as e:
-                      logs['errors'].append(f'body: {e}')
-                  elements = await page.locator('button, a, [role="button"]').all()
-                  for idx, el in enumerate(elements[:500]):
+                  (OUT/'body.txt').write_text(await page.locator('body').inner_text(), encoding='utf-8')
+                  els = page.locator('button, a, [role="button"], input, [data-testid]')
+                  for i in range(min(await els.count(), 1000)):
+                      el = els.nth(i)
                       try:
-                          logs['candidates'].append({'idx': idx,'tag': await el.evaluate('(e)=>e.tagName'),'text': (await el.inner_text()).strip()[:300],'aria': await el.get_attribute('aria-label'),'title': await el.get_attribute('title'),'href': await el.get_attribute('href'),'testid': await el.get_attribute('data-testid')})
-                      except Exception:
-                          pass
-                  downloaded=[]
-                  selectors=['button:has-text("Download")','a:has-text("Download")','[role="button"]:has-text("Download")','[aria-label*="download" i]','[title*="download" i]','[data-testid*="download" i]','a[download]']
-                  tried=set()
-                  for sel in selectors:
-                      try:
-                          locs=page.locator(sel)
-                          for i in range(min(await locs.count(),20)):
-                              loc=locs.nth(i)
-                              try:
-                                  key=await loc.evaluate('(e)=>e.outerHTML.slice(0,500)')
-                                  if key in tried or not await loc.is_visible(): continue
-                                  tried.add(key)
-                                  async with page.expect_download(timeout=90000) as di:
-                                      await loc.click(timeout=15000)
-                                  dl=await di.value
-                                  dest=OUT/(dl.suggested_filename or f'download_{len(downloaded)}')
-                                  await dl.save_as(str(dest))
-                                  downloaded.append(str(dest))
-                                  await page.wait_for_timeout(3000)
-                              except Exception as e:
-                                  logs['errors'].append(f'click {sel}[{i}]: {type(e).__name__}: {e}')
+                          logs['elements'].append({
+                              'i': i,
+                              'tag': await el.evaluate('(e)=>e.tagName'),
+                              'visible': await el.is_visible(),
+                              'text': (await el.inner_text()).strip()[:500],
+                              'aria': await el.get_attribute('aria-label'),
+                              'title': await el.get_attribute('title'),
+                              'href': await el.get_attribute('href'),
+                              'download': await el.get_attribute('download'),
+                              'testid': await el.get_attribute('data-testid'),
+                              'class': (await el.get_attribute('class') or '')[:500],
+                              'outer': (await el.evaluate('(e)=>e.outerHTML'))[:1500]
+                          })
                       except Exception as e:
-                          logs['errors'].append(f'selector {sel}: {e}')
-                  logs['downloaded']=downloaded
-                  logs['url_final']=page.url
-                  (OUT/'diagnostics.json').write_text(json.dumps(logs,indent=2,ensure_ascii=False),encoding='utf-8')
+                          logs['errors'].append(f'element {i}: {e}')
+                  logs['url_final'] = page.url
+                  logs['title'] = await page.title()
+                  (OUT/'diagnostics.json').write_text(json.dumps(logs, indent=2, ensure_ascii=False), encoding='utf-8')
                   await browser.close()
 
           try:
               asyncio.run(main())
           except Exception:
-              (OUT/'fatal.txt').write_text(traceback.format_exc(),encoding='utf-8')
+              (OUT/'fatal.txt').write_text(traceback.format_exc(), encoding='utf-8')
               raise
           PY
-          python /tmp/retrieve.py
+          python retrieve.py
           find ctf_fly_output -maxdepth 2 -type f -printf '%f\t%s bytes\n' | tee ctf_fly_output/files.txt
 
       - name: Upload retrieval artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ctf-fly-retrieval
+          name: ctf-fly-diagnostics
           path: ctf_fly_output/
           if-no-files-found: error
           retention-days: 1
@@ -125,5 +99,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          BODY=$(printf 'Temporary retrieval run completed.\n\nRun ID: `%s`\n\nFiles:\n```\n%s\n```' "$GITHUB_RUN_ID" "$(cat ctf_fly_output/files.txt 2>/dev/null || true)")
+          BODY=$(printf 'Temporary diagnostics completed.\n\nRun ID: `%s`\n\nFiles:\n```\n%s\n```' "$GITHUB_RUN_ID" "$(cat ctf_fly_output/files.txt 2>/dev/null || true)")
           gh issue comment 1 --repo NetKingJ/NKHashing --body "$BODY"
