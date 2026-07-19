@@ -25,12 +25,12 @@ jobs:
           pip install playwright
           playwright install chromium --with-deps
 
-      - name: Inspect Proton Drive share
+      - name: Retrieve original shared image
         env:
           SHARE_URL: 'https://drive.proton.me/urls/E73WE0CN2C#FscRsttW3OYJ'
         run: |
           cat > retrieve.py <<'PY'
-          import asyncio, json, os, traceback
+          import asyncio, base64, json, os, traceback
           from pathlib import Path
           from playwright.async_api import async_playwright
 
@@ -39,42 +39,70 @@ jobs:
           URL = os.environ['SHARE_URL']
 
           async def main():
-              logs = {'console': [], 'requests': [], 'responses': [], 'errors': [], 'elements': []}
+              diagnostics = {'errors': [], 'images': [], 'saved_responses': [], 'downloaded': []}
               async with async_playwright() as p:
                   browser = await p.chromium.launch(headless=True)
-                  context = await browser.new_context(accept_downloads=True, viewport={'width': 1440, 'height': 1000})
+                  context = await browser.new_context(accept_downloads=True, viewport={'width': 1600, 'height': 1200})
                   page = await context.new_page()
-                  page.on('console', lambda m: logs['console'].append(f'{m.type}: {m.text}'))
-                  page.on('pageerror', lambda e: logs['errors'].append(str(e)))
-                  page.on('request', lambda r: logs['requests'].append({'method':r.method,'resource':r.resource_type,'url':r.url}) if len(logs['requests']) < 1500 else None)
-                  page.on('response', lambda r: logs['responses'].append({'status':r.status,'url':r.url,'content_type':r.headers.get('content-type','')}) if len(logs['responses']) < 1500 else None)
+
+                  async def capture_response(resp):
+                      try:
+                          u = resp.url
+                          if any(s in u for s in ('/info','/auth','/links','/revisions/')):
+                              body = await resp.body()
+                              name = f"response_{len(diagnostics['saved_responses']):02d}.bin"
+                              (OUT/name).write_bytes(body)
+                              diagnostics['saved_responses'].append({'name':name,'url':u,'status':resp.status,'headers':resp.headers})
+                      except Exception as e:
+                          diagnostics['errors'].append(f'response capture: {e}')
+                  page.on('response', lambda r: asyncio.create_task(capture_response(r)))
+
                   await page.goto(URL, wait_until='domcontentloaded', timeout=120000)
-                  await page.wait_for_timeout(20000)
+                  await page.wait_for_timeout(25000)
                   await page.screenshot(path=str(OUT/'page.png'), full_page=True)
                   (OUT/'page.html').write_text(await page.content(), encoding='utf-8')
                   (OUT/'body.txt').write_text(await page.locator('body').inner_text(), encoding='utf-8')
-                  els = page.locator('button, a, [role="button"], input, [data-testid]')
-                  for i in range(min(await els.count(), 1000)):
-                      el = els.nth(i)
+
+                  imgs = page.locator('img')
+                  for i in range(await imgs.count()):
+                      el = imgs.nth(i)
+                      src = await el.get_attribute('src')
+                      rec = {'i':i,'src':src,'alt':await el.get_attribute('alt'),'width':await el.get_attribute('width'),'height':await el.get_attribute('height')}
+                      diagnostics['images'].append(rec)
+                      if src and src.startswith('blob:'):
+                          try:
+                              b64 = await page.evaluate("""async (u) => {
+                                const r = await fetch(u); const b = await r.arrayBuffer();
+                                let binary=''; const bytes=new Uint8Array(b); const chunk=0x8000;
+                                for(let i=0;i<bytes.length;i+=chunk){binary += String.fromCharCode(...bytes.subarray(i,i+chunk));}
+                                return btoa(binary);
+                              }""", src)
+                              raw = base64.b64decode(b64)
+                              ext = '.png' if raw.startswith(b'\x89PNG') else '.jpg' if raw.startswith(b'\xff\xd8') else '.bin'
+                              name = f'blob_image_{i}{ext}'
+                              (OUT/name).write_bytes(raw)
+                              rec['saved_as'] = name
+                              rec['size'] = len(raw)
+                          except Exception as e:
+                              diagnostics['errors'].append(f'blob image {i}: {e}')
+
+                  # The visible exact Proton download control.
+                  btn = page.locator('[data-testid="dropdown-download-button"]')
+                  if await btn.count() and await btn.first.is_visible():
                       try:
-                          logs['elements'].append({
-                              'i': i,
-                              'tag': await el.evaluate('(e)=>e.tagName'),
-                              'visible': await el.is_visible(),
-                              'text': (await el.inner_text()).strip()[:500],
-                              'aria': await el.get_attribute('aria-label'),
-                              'title': await el.get_attribute('title'),
-                              'href': await el.get_attribute('href'),
-                              'download': await el.get_attribute('download'),
-                              'testid': await el.get_attribute('data-testid'),
-                              'class': (await el.get_attribute('class') or '')[:500],
-                              'outer': (await el.evaluate('(e)=>e.outerHTML'))[:1500]
-                          })
+                          async with page.expect_download(timeout=60000) as di:
+                              await btn.first.click(timeout=10000)
+                          dl = await di.value
+                          name = dl.suggested_filename or 'Orange.png'
+                          await dl.save_as(str(OUT/name))
+                          diagnostics['downloaded'].append(name)
                       except Exception as e:
-                          logs['errors'].append(f'element {i}: {e}')
-                  logs['url_final'] = page.url
-                  logs['title'] = await page.title()
-                  (OUT/'diagnostics.json').write_text(json.dumps(logs, indent=2, ensure_ascii=False), encoding='utf-8')
+                          diagnostics['errors'].append(f'download: {type(e).__name__}: {e}')
+
+                  await page.wait_for_timeout(5000)
+                  diagnostics['title'] = await page.title()
+                  diagnostics['url'] = page.url
+                  (OUT/'diagnostics.json').write_text(json.dumps(diagnostics, indent=2, ensure_ascii=False), encoding='utf-8')
                   await browser.close()
 
           try:
@@ -84,12 +112,12 @@ jobs:
               raise
           PY
           python retrieve.py
-          find ctf_fly_output -maxdepth 2 -type f -printf '%f\t%s bytes\n' | tee ctf_fly_output/files.txt
+          find ctf_fly_output -maxdepth 2 -type f -printf '%f\t%s bytes\n' | sort | tee ctf_fly_output/files.txt
 
       - name: Upload retrieval artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ctf-fly-diagnostics
+          name: ctf-fly-original
           path: ctf_fly_output/
           if-no-files-found: error
           retention-days: 1
@@ -99,5 +127,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          BODY=$(printf 'Temporary diagnostics completed.\n\nRun ID: `%s`\n\nFiles:\n```\n%s\n```' "$GITHUB_RUN_ID" "$(cat ctf_fly_output/files.txt 2>/dev/null || true)")
+          BODY=$(printf 'Temporary original retrieval completed.\n\nRun ID: `%s`\n\nFiles:\n```\n%s\n```' "$GITHUB_RUN_ID" "$(cat ctf_fly_output/files.txt 2>/dev/null || true)")
           gh issue comment 1 --repo NetKingJ/NKHashing --body "$BODY"
